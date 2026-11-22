@@ -1,0 +1,15 @@
+{
+  "id": "resp_nocode",
+  "status": "completed",
+  "model": "gpt-6-luna",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "I can answer without running code.", "annotations": []}]
+    }
+  ],
+  "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+}

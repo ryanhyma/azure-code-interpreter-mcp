@@ -1,0 +1,1171 @@
+diff --git a/api/server/controllers/agents/callbacks.js b/api/server/controllers/agents/callbacks.js
+index bc3cdef96..7b3261903 100644
+--- a/api/server/controllers/agents/callbacks.js
++++ b/api/server/controllers/agents/callbacks.js
+@@ -1038,7 +1038,11 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null, jo
+           }),
+         );
+       }
+-      return;
++      /** A tool that returns images AND files must deliver both: only stop here when
++       *  there is no code-artifact file list to fall through to. */
++      if (!isCodeArtifactToolOutput(output) || !output.artifact.files) {
++        return;
++      }
+     }
+ 
+     if (!isCodeArtifactToolOutput(output)) {
+diff --git a/api/server/index.js b/api/server/index.js
+index e38945062..3e96ef44d 100644
+--- a/api/server/index.js
++++ b/api/server/index.js
+@@ -483,6 +483,7 @@ const startServer = async () => {
+   app.use('/api/models', routes.models);
+   app.use('/api/config', preAuthTenantMiddleware, optionalJwtAuth, routes.config);
+   app.use('/api/assistants', routes.assistants);
++  app.use('/api/azci', routes.azci);
+   app.use('/api/files', await routes.files.initialize());
+   app.use(
+     '/images/',
+diff --git a/api/server/routes/__tests__/azci.spec.js b/api/server/routes/__tests__/azci.spec.js
+new file mode 100644
+index 000000000..5ced8f88e
+--- /dev/null
++++ b/api/server/routes/__tests__/azci.spec.js
+@@ -0,0 +1,197 @@
++jest.mock('~/models', () => ({
++  getMessages: jest.fn(),
++  getFiles: jest.fn(),
++  getAgent: jest.fn(),
++  getConvo: jest.fn(),
++}));
++
++jest.mock('~/server/middleware', () => ({
++  configMiddleware: (req, _res, next) => {
++    req.config = { paths: { uploads: '/uploads' } };
++    next();
++  },
++}));
++
++jest.mock('~/server/services/Files/strategies', () => ({
++  getStrategyFunctions: jest.fn(),
++}));
++
++jest.mock('@librechat/data-schemas', () => ({
++  logger: { error: jest.fn(), warn: jest.fn() },
++}));
++
++const { Readable } = require('stream');
++const express = require('express');
++const request = require('supertest');
++const db = require('~/models');
++const { getStrategyFunctions } = require('~/server/services/Files/strategies');
++const azciRoute = require('../azci');
++
++const TOKEN = 'test-token';
++const USER = 'user-1';
++const CONV = 'conv-1';
++
++function app() {
++  const instance = express();
++  instance.use('/api/azci', azciRoute);
++  return instance;
++}
++
++function authed(req) {
++  return req.set('X-Azci-Token', TOKEN).set('X-LibreChat-User-Id', USER);
++}
++
++beforeEach(() => {
++  process.env.AZCI_MCP_TOKEN = TOKEN;
++  jest.clearAllMocks();
++  db.getConvo.mockResolvedValue(null);
++  db.getAgent.mockResolvedValue(null);
++  db.getMessages.mockResolvedValue([]);
++  db.getFiles.mockResolvedValue([]);
++});
++
++describe('azci bridge auth', () => {
++  it('returns 401 without the shared token', async () => {
++    await request(app()).get('/api/azci/files').query({ conversationId: CONV }).expect(401);
++  });
++
++  it('returns 401 for a wrong token', async () => {
++    await request(app())
++      .get('/api/azci/files')
++      .query({ conversationId: CONV })
++      .set('X-Azci-Token', 'nope')
++      .set('X-LibreChat-User-Id', USER)
++      .expect(401);
++  });
++
++  it('returns 400 without a user id', async () => {
++    await request(app())
++      .get('/api/azci/files')
++      .query({ conversationId: CONV })
++      .set('X-Azci-Token', TOKEN)
++      .expect(400);
++  });
++});
++
++describe('azci file listing', () => {
++  it('unions attachments across recent user messages and dedupes ids', async () => {
++    db.getMessages.mockResolvedValue([
++      { files: [{ file_id: 'f2' }] },
++      { files: [] },
++      { files: ['f1', { file_id: 'f2' }] },
++    ]);
++    db.getFiles.mockResolvedValue([
++      { file_id: 'f1', filename: 'a.csv', bytes: 1, type: 'text/csv', source: 'local' },
++      { file_id: 'f2', filename: 'b.csv', bytes: 2, type: 'text/csv', source: 'local' },
++    ]);
++
++    const res = await authed(request(app()).get('/api/azci/files').query({ conversationId: CONV })).expect(200);
++
++    expect(db.getMessages).toHaveBeenCalledWith(
++      { conversationId: CONV, isCreatedByUser: true },
++      'files',
++      expect.objectContaining({ limit: 20 }),
++    );
++    expect(db.getFiles).toHaveBeenCalledWith(
++      { file_id: { $in: expect.arrayContaining(['f1', 'f2']) }, user: USER },
++      null,
++      { text: 0 },
++    );
++    const ids = res.body.files.map((f) => f.file_id);
++    expect(ids).toEqual(expect.arrayContaining(['f1', 'f2']));
++    expect(ids).toHaveLength(2);
++  });
++
++  it('includes files attached once to the agent context', async () => {
++    db.getMessages.mockResolvedValue([{ files: [] }]);
++    db.getAgent.mockResolvedValue({
++      tool_resources: {
++        mcp: { file_ids: ['ctx-1'], files: [{ file_id: 'ctx-2' }] },
++        context: { file_ids: ['ignored-context'] },
++      },
++    });
++    const rows = [
++      { file_id: 'ctx-1', filename: 'context.pdf', bytes: 1, type: 'application/pdf', source: 'local' },
++      { file_id: 'ctx-2', filename: 'notes.docx', bytes: 1, type: 'application/docx', source: 'local' },
++      { file_id: 'fs-1', filename: 'search.txt', bytes: 1, type: 'text/plain', source: 'local' },
++    ];
++    db.getFiles.mockImplementation(async (filter) => {
++      const wanted = filter?.file_id?.$in;
++      return wanted ? rows.filter((row) => wanted.includes(row.file_id)) : rows;
++    });
++
++    const res = await authed(
++      request(app())
++        .get('/api/azci/files')
++        .query({ conversationId: CONV, agentId: 'agent-1' })
++        .set('X-LibreChat-Agent-Id', 'agent-1'),
++    ).expect(200);
++
++    expect(db.getAgent).toHaveBeenCalledWith(
++      { id: 'agent-1', author: USER },
++      { tool_resources: 1 },
++    );
++    expect(res.body.files.map((f) => f.file_id)).toEqual(['ctx-1', 'ctx-2']);
++  });
++
++  it('derives the agent from the conversation when no agent id is supplied', async () => {
++    db.getConvo.mockResolvedValue({ agent_id: 'agent-from-convo' });
++    db.getMessages.mockResolvedValue([{ files: [] }]);
++    db.getAgent.mockResolvedValue({
++      tool_resources: { mcp: { file_ids: ['ctx-9'] } },
++    });
++    db.getFiles.mockResolvedValue([
++      { file_id: 'ctx-9', filename: 'brief.docx', bytes: 1, type: 'application/docx', source: 'local' },
++    ]);
++
++    const res = await authed(
++      request(app()).get('/api/azci/files').query({ conversationId: CONV }),
++    ).expect(200);
++
++    expect(db.getConvo).toHaveBeenCalledWith(USER, CONV);
++    expect(db.getAgent).toHaveBeenCalledWith(
++      { id: 'agent-from-convo', author: USER },
++      { tool_resources: 1 },
++    );
++    expect(res.body.files.map((f) => f.file_id)).toEqual(['ctx-9']);
++  });
++
++  it('returns an empty list when no user message carries a file', async () => {
++    db.getMessages.mockResolvedValue([{ files: [] }]);
++    const res = await authed(request(app()).get('/api/azci/files').query({ conversationId: CONV })).expect(200);
++    expect(res.body.files).toEqual([]);
++    expect(db.getFiles).not.toHaveBeenCalled();
++  });
++});
++
++describe('azci file download', () => {
++  it('streams the bytes of a conversation attachment', async () => {
++    db.getMessages.mockResolvedValue([{ files: [{ file_id: 'f1' }] }]);
++    db.getFiles.mockResolvedValue([
++      { file_id: 'f1', filename: 'a.csv', filepath: '/uploads/a.csv', source: 'local' },
++    ]);
++    getStrategyFunctions.mockReturnValue({
++      getDownloadStream: jest.fn().mockResolvedValue(Readable.from(Buffer.from('a,b\n1,2\n'))),
++    });
++
++    const res = await authed(
++      request(app()).get('/api/azci/files/f1').query({ conversationId: CONV }),
++    ).expect(200);
++
++    expect(Buffer.from(res.body).toString()).toBe('a,b\n1,2\n');
++  });
++
++  it('returns 404 when the file is not among the conversation attachments', async () => {
++    db.getMessages.mockResolvedValue([{ files: [{ file_id: 'other' }] }]);
++    db.getFiles.mockResolvedValue([{ file_id: 'other', filename: 'x.csv', source: 'local' }]);
++
++    await authed(request(app()).get('/api/azci/files/f1').query({ conversationId: CONV })).expect(404);
++  });
++
++  it('refuses a source that has no local stream', async () => {
++    db.getMessages.mockResolvedValue([{ files: [{ file_id: 'f1' }] }]);
++    db.getFiles.mockResolvedValue([{ file_id: 'f1', filename: 'a.csv', source: 's3' }]);
++
++    await authed(request(app()).get('/api/azci/files/f1').query({ conversationId: CONV })).expect(422);
++  });
++});
+diff --git a/api/server/routes/azci.js b/api/server/routes/azci.js
+new file mode 100644
+index 000000000..069491574
+--- /dev/null
++++ b/api/server/routes/azci.js
+@@ -0,0 +1,150 @@
++/**
++ * Internal bridge used by the Azure Code Interpreter MCP server to pull chat attachments
++ * into the sandbox. Authenticated with the same shared secret LibreChat sends on MCP calls;
++ * the caller supplies the authenticated user id and conversation id it already received.
++ */
++const crypto = require('node:crypto');
++const express = require('express');
++const { FileSources } = require('librechat-data-provider');
++const { logger } = require('@librechat/data-schemas');
++const db = require('~/models');
++const { getStrategyFunctions } = require('~/server/services/Files/strategies');
++const { configMiddleware } = require('~/server/middleware');
++
++const router = express.Router();
++
++function tokenMatches(expected, received) {
++  if (typeof expected !== 'string' || !expected || typeof received !== 'string' || !received) {
++    return false;
++  }
++  const a = Buffer.from(expected);
++  const b = Buffer.from(received);
++  return a.length === b.length && crypto.timingSafeEqual(a, b);
++}
++
++router.use(configMiddleware);
++
++router.use((req, res, next) => {
++  if (!tokenMatches(process.env.AZCI_MCP_TOKEN, req.get('x-azci-token'))) {
++    return res.status(401).json({ error: 'unauthorized' });
++  }
++  const userId = req.get('x-librechat-user-id');
++  const conversationId = req.query.conversationId || req.get('x-librechat-conversation-id');
++  const agentId = req.query.agentId || req.get('x-librechat-agent-id');
++  if (!userId || !conversationId) {
++    return res.status(400).json({ error: 'missing user or conversation' });
++  }
++  req.azci = { userId, conversationId, agentId: agentId || undefined };
++  next();
++});
++
++/**
++ * Resolve the files attached across a conversation's recent user messages. A follow-up
++ * message often carries no attachment, so reading only the latest one would lose the
++ * document the user attached earlier.
++ */
++/** File ids attached once to the agent (File Context / File Search resources). */
++async function agentFileIds(userId, agentId) {
++  if (!agentId) {
++    return [];
++  }
++  const agent = await db.getAgent({ id: agentId, author: userId }, { tool_resources: 1 });
++  const resources = agent?.tool_resources ?? {};
++  const ids = new Set();
++  for (const key of ['mcp']) {
++    const resource = resources[key] ?? {};
++    for (const id of resource.file_ids ?? []) {
++      ids.add(id);
++    }
++    for (const file of resource.files ?? []) {
++      if (file?.file_id) {
++        ids.add(file.file_id);
++      }
++    }
++  }
++  return [...ids];
++}
++
++async function conversationFileIds(userId, conversationId, agentId) {
++  if (!agentId) {
++    // The conversation records its agent, so no extra header/placeholder is needed.
++    const conversation = await db.getConvo(userId, conversationId);
++    agentId = conversation?.agent_id;
++  }
++  const messages = await db.getMessages(
++    { conversationId, isCreatedByUser: true },
++    'files',
++    { sort: { createdAt: -1 }, limit: 20 },
++  );
++  const ids = new Set(await agentFileIds(userId, agentId));
++  for (const message of messages ?? []) {
++    for (const entry of message?.files ?? []) {
++      const id = typeof entry === 'string' ? entry : entry?.file_id;
++      if (id) {
++        ids.add(id);
++      }
++    }
++  }
++  if (!ids.size) {
++    return [];
++  }
++  const files = await db.getFiles(
++    { file_id: { $in: [...ids] }, user: userId },
++    null,
++    { text: 0 },
++  );
++  return files ?? [];
++}
++
++/** List the user-uploaded attachments of one conversation. */
++router.get('/files', async (req, res) => {
++  try {
++    const { userId, conversationId } = req.azci;
++    const files = await conversationFileIds(userId, conversationId, req.azci.agentId);
++    res.json({
++      files: (files ?? []).map((file) => ({
++        file_id: file.file_id,
++        filename: file.filename,
++        bytes: file.bytes,
++        type: file.type,
++        source: file.source,
++      })),
++    });
++  } catch (error) {
++    logger.error('[azci] list files failed', error);
++    res.status(500).json({ error: 'list failed' });
++  }
++});
++
++/** Stream one attachment's bytes. */
++router.get('/files/:fileId', async (req, res) => {
++  try {
++    const { userId, conversationId } = req.azci;
++    const owned = await conversationFileIds(userId, conversationId, req.azci.agentId);
++    const file = owned.find((entry) => entry.file_id === req.params.fileId);
++    if (!file) {
++      return res.status(404).json({ error: 'not found' });
++    }
++    if (file.source !== FileSources.local) {
++      return res.status(422).json({ error: `unsupported source: ${file.source}` });
++    }
++    const { getDownloadStream } = getStrategyFunctions(file.source);
++    const stream = await getDownloadStream(req, file.storageKey || file.filepath);
++    res.setHeader('Content-Type', 'application/octet-stream');
++    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.filename)}"`);
++    stream.on('error', (error) => {
++      logger.error('[azci] stream failed', error);
++      if (!res.headersSent) {
++        res.status(500).end();
++      }
++    });
++    stream.pipe(res);
++  } catch (error) {
++    logger.error('[azci] download failed', error);
++    if (!res.headersSent) {
++      res.status(500).json({ error: 'download failed' });
++    }
++  }
++});
++
++module.exports = router;
+diff --git a/api/server/routes/index.js b/api/server/routes/index.js
+index ce071e858..ac2990fce 100644
+--- a/api/server/routes/index.js
++++ b/api/server/routes/index.js
+@@ -37,6 +37,7 @@ const channels = require('./channels');
+ const roles = require('./roles');
+ const oauth = require('./oauth');
+ const files = require('./files');
++const azci = require('./azci');
+ const share = require('./share');
+ const tags = require('./tags');
+ const auth = require('./auth');
+@@ -70,6 +71,7 @@ module.exports = {
+   roles,
+   oauth,
+   files,
++  azci,
+   share,
+   banner,
+   openapi,
+diff --git a/client/src/common/agents-types.ts b/client/src/common/agents-types.ts
+index 02f11a2bd..c8043d44f 100644
+--- a/client/src/common/agents-types.ts
++++ b/client/src/common/agents-types.ts
+@@ -20,6 +20,7 @@ export type TAgentOption = OptionWithIcon &
+     knowledge_files?: Array<[string, ExtendedFile]>;
+     context_files?: Array<[string, ExtendedFile]>;
+     code_files?: Array<[string, ExtendedFile]>;
++    mcp_files?: Array<[string, ExtendedFile]>;
+     _id?: string;
+   };
+ 
+diff --git a/client/src/components/SidePanel/Agents/McpFiles.tsx b/client/src/components/SidePanel/Agents/McpFiles.tsx
+new file mode 100644
+index 000000000..4d1e7e903
+--- /dev/null
++++ b/client/src/components/SidePanel/Agents/McpFiles.tsx
+@@ -0,0 +1,209 @@
++import { memo, useMemo, useRef, useState } from 'react';
++import * as Ariakit from '@ariakit/react';
++import { Folder, Plus, Info } from 'lucide-react';
++import { EModelEndpoint, EToolResources } from 'librechat-data-provider';
++import { Button, DropdownPopup, SharePointIcon, TooltipAnchor } from '@librechat/client';
++import type { ExtendedFile } from '~/common';
++import { useSharePointFileHandlingNoChatContext } from '~/hooks/Files/useSharePointFileHandling';
++import { useFileHandlingNoChatContext } from '~/hooks/Files/useFileHandling';
++import { useAgentFileConfig, useLocalize, useLazyEffect } from '~/hooks';
++import { SharePointPickerDialog } from '~/components/SharePoint';
++import FileRow from '~/components/Chat/Input/Files/FileRow';
++import { useGetStartupConfig } from '~/data-provider';
++import { isEphemeralAgent } from '~/common';
++import { cn } from '~/utils';
++
++const addButtonClassName = cn(
++  'inline-flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-2 text-xs font-medium text-text-secondary transition-colors',
++  'hover:bg-surface-secondary hover:text-text-primary focus-visible:ring-2 focus-visible:ring-ring-primary',
++  'disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-text-secondary',
++);
++
++function McpFiles({
++  agent_id,
++  files: _files,
++  showHeader = true,
++}: {
++  agent_id: string;
++  files?: [string, ExtendedFile][];
++  showHeader?: boolean;
++}) {
++  const localize = useLocalize();
++  const fileInputRef = useRef<HTMLInputElement>(null);
++  const [files, setFiles] = useState<Map<string, ExtendedFile>>(new Map());
++  const fileHandlingState = useMemo(() => ({ files, setFiles, conversation: null }), [files]);
++  const [isPopoverActive, setIsPopoverActive] = useState(false);
++  const [isSharePointDialogOpen, setIsSharePointDialogOpen] = useState(false);
++  const { data: startupConfig } = useGetStartupConfig();
++  const sharePointEnabled = startupConfig?.sharePointFilePickerEnabled;
++  const { endpointFileConfig, providerValue, endpointType } = useAgentFileConfig();
++  const endpointOverride = providerValue || EModelEndpoint.agents;
++
++  const { handleFileChange } = useFileHandlingNoChatContext(
++    {
++      additionalMetadata: { agent_id, tool_resource: EToolResources.mcp },
++      endpointOverride,
++      endpointTypeOverride: endpointType,
++      fileSetter: setFiles,
++    },
++    fileHandlingState,
++  );
++  const { handleSharePointFiles, isProcessing, downloadProgress } =
++    useSharePointFileHandlingNoChatContext(
++      {
++        additionalMetadata: { agent_id, tool_resource: EToolResources.mcp },
++        endpointOverride,
++        endpointTypeOverride: endpointType,
++        fileSetter: setFiles,
++      },
++      fileHandlingState,
++    );
++  useLazyEffect(
++    () => {
++      if (_files) {
++        setFiles(new Map(_files));
++      }
++    },
++    [_files],
++    750,
++  );
++  const isUploadDisabled = endpointFileConfig?.disabled ?? false;
++  const disabledUploadButton = isEphemeralAgent(agent_id);
++  const handleSharePointFilesSelected = async (sharePointFiles: any[]) => {
++    try {
++      await handleSharePointFiles(sharePointFiles);
++      setIsSharePointDialogOpen(false);
++    } catch (error) {
++      console.error('SharePoint file processing error:', error);
++    }
++  };
++  if (isUploadDisabled) {
++    return null;
++  }
++
++  const handleLocalFileClick = () => {
++    // necessary to reset the input
++    if (fileInputRef.current) {
++      fileInputRef.current.value = '';
++    }
++    fileInputRef.current?.click();
++  };
++  const dropdownItems = [
++    {
++      label: localize('com_files_upload_local_machine'),
++      onClick: handleLocalFileClick,
++      icon: <Folder className="icon-md" />,
++    },
++    {
++      label: localize('com_files_upload_sharepoint'),
++      onClick: () => setIsSharePointDialogOpen(true),
++      icon: <SharePointIcon className="icon-md" />,
++    },
++  ];
++
++  const addLabel = localize('com_ui_upload_mcp_files');
++  const fileCount = files.size;
++
++  const addControl = sharePointEnabled ? (
++    <DropdownPopup
++      gutter={2}
++      menuId="file-context-upload-menu"
++      isOpen={isPopoverActive}
++      setIsOpen={setIsPopoverActive}
++      trigger={
++        <Ariakit.MenuButton
++          disabled={disabledUploadButton}
++          aria-label={addLabel}
++          className={cn(addButtonClassName, 'focus:outline-hidden')}
++        >
++          <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
++          {localize('com_ui_add')}
++        </Ariakit.MenuButton>
++      }
++      items={dropdownItems}
++      modal={true}
++      unmountOnHide={true}
++    />
++  ) : (
++    <Button
++      variant="outline"
++      disabled={disabledUploadButton}
++      aria-label={addLabel}
++      onClick={handleLocalFileClick}
++    >
++      <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
++      {localize('com_ui_add')}
++    </Button>
++  );
++
++  return (
++    <div className="flex flex-col gap-2">
++      <div className="flex items-center justify-between gap-2">
++        {showHeader ? (
++          <div className="flex min-w-0 items-center gap-1.5">
++            <span className="text-text-secondary text-2xs truncate font-medium tracking-wide uppercase">
++              {localize('com_agents_mcp_files_label')}
++            </span>
++            <TooltipAnchor
++              description={localize('com_agents_mcp_files_description')}
++              side="top"
++              render={
++                <button
++                  type="button"
++                  aria-label={localize('com_agents_mcp_files_description')}
++                  className="text-text-tertiary hover:text-text-secondary focus-visible:ring-ring-primary flex size-4 shrink-0 items-center justify-center rounded transition-colors focus:outline-hidden focus-visible:ring-2"
++                >
++                  <Info className="size-3.5" aria-hidden="true" />
++                </button>
++              }
++            />
++            {fileCount > 0 && (
++              <span className="bg-surface-tertiary text-text-secondary text-3xs inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full px-1.5 font-medium">
++                {fileCount}
++              </span>
++            )}
++          </div>
++        ) : (
++          <span />
++        )}
++        {addControl}
++      </div>
++      {fileCount > 0 && (
++        <FileRow
++          files={files}
++          setFiles={setFiles}
++          agent_id={agent_id}
++          tool_resource={EToolResources.mcp}
++          Wrapper={({ children }) => <div className="flex flex-wrap gap-2">{children}</div>}
++        />
++      )}
++      {!agent_id && (
++        <p className="text-text-secondary text-2xs leading-snug">
++          {localize('com_agents_mcp_files_disabled')}
++        </p>
++      )}
++      <input
++        multiple={true}
++        type="file"
++        className="hidden"
++        tabIndex={-1}
++        ref={fileInputRef}
++        disabled={disabledUploadButton}
++        onChange={handleFileChange}
++      />
++      <SharePointPickerDialog
++        isOpen={isSharePointDialogOpen}
++        onOpenChange={setIsSharePointDialogOpen}
++        onFilesSelected={handleSharePointFilesSelected}
++        isDownloading={isProcessing}
++        downloadProgress={downloadProgress}
++        maxSelectionCount={endpointFileConfig?.fileLimit}
++      />
++    </div>
++  );
++}
++
++const MemoizedMcpFiles = memo(McpFiles);
++MemoizedMcpFiles.displayName = 'McpFiles';
++
++export default MemoizedMcpFiles;
+diff --git a/client/src/components/SidePanel/Agents/Tools/ItemDialog/ItemDialogBody.tsx b/client/src/components/SidePanel/Agents/Tools/ItemDialog/ItemDialogBody.tsx
+index a05ba866d..e9f64e5c8 100644
+--- a/client/src/components/SidePanel/Agents/Tools/ItemDialog/ItemDialogBody.tsx
++++ b/client/src/components/SidePanel/Agents/Tools/ItemDialog/ItemDialogBody.tsx
+@@ -13,7 +13,7 @@ interface Props {
+ }
+ 
+ export default function ItemDialogBody({ item, agentId, onClose }: Props) {
+-  const { contextFiles, knowledgeFiles, codeFiles } = useAgentFileEntries();
++  const { contextFiles, knowledgeFiles, codeFiles, mcpFiles } = useAgentFileEntries();
+ 
+   if (item.kind === 'builtin') {
+     return (
+@@ -34,7 +34,7 @@ export default function ItemDialogBody({ item, agentId, onClose }: Props) {
+     return <SkillSection item={item} />;
+   }
+   if (item.kind === 'mcp') {
+-    return <McpSection item={item} />;
++    return <McpSection item={item} agentId={agentId} mcpFiles={mcpFiles} />;
+   }
+   return <ActionSection item={item} agentId={agentId} onClose={onClose} />;
+ }
+diff --git a/client/src/components/SidePanel/Agents/Tools/ItemDialog/__tests__/McpSection.spec.tsx b/client/src/components/SidePanel/Agents/Tools/ItemDialog/__tests__/McpSection.spec.tsx
+index 2b8657f8e..b26e865bc 100644
+--- a/client/src/components/SidePanel/Agents/Tools/ItemDialog/__tests__/McpSection.spec.tsx
++++ b/client/src/components/SidePanel/Agents/Tools/ItemDialog/__tests__/McpSection.spec.tsx
+@@ -34,6 +34,16 @@ jest.mock('~/hooks/MCP/useMCPRefresh', () => ({
+   useMCPRefresh: (options: { enabled: boolean; tools?: boolean }) => mockMCPRefresh(options),
+ }));
+ 
++const mockFormAgentId = jest.fn((): string | undefined => 'agent-from-form');
++const mockFormAgent = jest.fn((): { id?: string } | undefined => undefined);
++
++jest.mock('../../../McpFiles', () => ({
++  __esModule: true,
++  default: ({ agent_id }: { agent_id: string }) => (
++    <div data-testid="mcp-files-pool">pool:{agent_id}</div>
++  ),
++}));
++
+ jest.mock('react-hook-form', () => ({
+   useFormContext: () => ({ control: {}, setValue: mockSetValue, getValues: mockGetValues }),
+   useWatch: ({ name }: { name: string }) => {
+@@ -43,6 +53,12 @@ jest.mock('react-hook-form', () => ({
+     if (name === 'execute_code') {
+       return mockCodeInterpreterSelected();
+     }
++    if (name === 'id') {
++      return mockFormAgentId();
++    }
++    if (name === 'agent') {
++      return mockFormAgent();
++    }
+     return mockGetValues();
+   },
+ }));
+@@ -842,4 +858,30 @@ describe('McpSection', () => {
+     render(<McpSection item={empty} />);
+     expect(screen.getByText('com_ui_tools_mcp_runtime_tools')).toBeInTheDocument();
+   });
++
++  describe('MCP file pool', () => {
++    it('renders the shared file pool with the agent id prop', () => {
++      render(<McpSection item={item} agentId="agent-prop" mcpFiles={[]} />);
++      expect(screen.getByRole('heading', { name: 'com_agents_mcp_files_label' })).toBeInTheDocument();
++      expect(screen.getByTestId('mcp-files-pool')).toHaveTextContent('pool:agent-prop');
++    });
++
++    it('falls back to the form id when the prop is absent', () => {
++      mockFormAgentId.mockReturnValue('agent-from-form');
++      render(<McpSection item={item} />);
++      expect(screen.getByTestId('mcp-files-pool')).toHaveTextContent('pool:agent-from-form');
++    });
++
++    it('falls back to the agent object id and hides when no id exists', () => {
++      mockFormAgentId.mockReturnValue(undefined);
++      mockFormAgent.mockReturnValue({ id: 'agent-from-object' });
++      const { unmount } = render(<McpSection item={item} />);
++      expect(screen.getByTestId('mcp-files-pool')).toHaveTextContent('pool:agent-from-object');
++      unmount();
++
++      mockFormAgent.mockReturnValue(undefined);
++      render(<McpSection item={item} />);
++      expect(screen.queryByRole('heading', { name: 'com_agents_mcp_files_label' })).toBeNull();
++    });
++  });
+ });
+diff --git a/client/src/components/SidePanel/Agents/Tools/ItemDialog/sections/McpSection.tsx b/client/src/components/SidePanel/Agents/Tools/ItemDialog/sections/McpSection.tsx
+index 219857f5a..e0a2f6420 100644
+--- a/client/src/components/SidePanel/Agents/Tools/ItemDialog/sections/McpSection.tsx
++++ b/client/src/components/SidePanel/Agents/Tools/ItemDialog/sections/McpSection.tsx
+@@ -34,6 +34,8 @@ import OptionToggle from '../../../OptionToggle';
+ import MCPToolItem from '../../../MCPToolItem';
+ import { Collapse } from '~/components/ui';
+ import { useLocalize } from '~/hooks';
++import type { ExtendedFile } from '~/common';
++import McpFiles from '../../../McpFiles';
+ import { cn } from '~/utils';
+ 
+ interface StatusDisplay {
+@@ -63,11 +65,18 @@ function getStatusDisplay(
+ 
+ interface Props {
+   item: McpItem;
++  agentId?: string;
++  /** Files added once to the shared MCP pool; not injected into model context. */
++  mcpFiles?: Array<[string, ExtendedFile]>;
+ }
+ 
+-export default function McpSection({ item }: Props) {
++export default function McpSection({ item, agentId, mcpFiles }: Props) {
+   const localize = useLocalize();
+   const { control, getValues, setValue } = useFormContext<AgentForm>();
++  /** The dialog may be rendered without the prop; the form always carries the agent id. */
++  const formAgentId = useWatch({ control, name: 'id' });
++  const formAgent = useWatch({ control, name: 'agent' });
++  const filesAgentId = agentId || formAgentId || formAgent?.id;
+   const {
+     getServerStatusIconProps,
+     getConfigDialogProps,
+@@ -447,6 +456,17 @@ export default function McpSection({ item }: Props) {
+ 
+   return (
+     <div className="flex flex-col gap-5">
++      {filesAgentId ? (
++        <section aria-labelledby="mcp-files-heading" className="flex flex-col gap-2">
++          <h3 id="mcp-files-heading" className="text-text-primary text-sm font-medium">
++            {localize('com_agents_mcp_files_label')}
++          </h3>
++          <p className="text-text-secondary text-xs">
++            {localize('com_agents_mcp_files_description')}
++          </p>
++          <McpFiles agent_id={filesAgentId} files={mcpFiles} showHeader={false} />
++        </section>
++      ) : null}
+       {item.description && (
+         <p className="text-text-secondary max-h-40 overflow-y-auto text-sm leading-relaxed whitespace-pre-wrap">
+           {item.description}
+diff --git a/client/src/components/SidePanel/Agents/Tools/hooks.ts b/client/src/components/SidePanel/Agents/Tools/hooks.ts
+index 07dd80b14..db712e747 100644
+--- a/client/src/components/SidePanel/Agents/Tools/hooks.ts
++++ b/client/src/components/SidePanel/Agents/Tools/hooks.ts
+@@ -86,6 +86,7 @@ export interface AgentFileEntries {
+   contextFiles: Array<[string, ExtendedFile]>;
+   knowledgeFiles: Array<[string, ExtendedFile]>;
+   codeFiles: Array<[string, ExtendedFile]>;
++  mcpFiles: Array<[string, ExtendedFile]>;
+ }
+ 
+ const NO_FILES: Array<[string, ExtendedFile]> = [];
+@@ -109,7 +110,7 @@ export function useAgentFileEntries(): AgentFileEntries {
+ 
+   return useMemo(() => {
+     if (agent == null || agent.id !== agentId) {
+-      return { contextFiles: NO_FILES, knowledgeFiles: NO_FILES, codeFiles: NO_FILES };
++      return { contextFiles: NO_FILES, knowledgeFiles: NO_FILES, codeFiles: NO_FILES, mcpFiles: NO_FILES };
+     }
+     const needsHydration =
+       agent.context_files == null || agent.knowledge_files == null || agent.code_files == null;
+@@ -127,6 +128,7 @@ export function useAgentFileEntries(): AgentFileEntries {
+       contextFiles: agent.context_files ?? processed?.context_files ?? NO_FILES,
+       knowledgeFiles: agent.knowledge_files ?? processed?.knowledge_files ?? NO_FILES,
+       codeFiles: agent.code_files ?? processed?.code_files ?? NO_FILES,
++      mcpFiles: agent.mcp_files ?? processed?.mcp_files ?? NO_FILES,
+     };
+   }, [agent, agentId, fileMap, agentFiles]);
+ }
+diff --git a/client/src/locales/en/translation.json b/client/src/locales/en/translation.json
+index ece65bff6..5717e77f1 100644
+--- a/client/src/locales/en/translation.json
++++ b/client/src/locales/en/translation.json
+@@ -4068,5 +4068,9 @@
+   "com_ui_slack_apps_redirect": "OAuth redirect URL",
+   "com_ui_slack_apps_events": "Events URL",
+   "com_ui_slack_apps_interactions": "Interactivity URL",
+-  "com_ui_slack_apps_empty": "No Slack apps yet. Create an app in Slack, then add its credentials here to connect agents to your workspace."
++  "com_ui_slack_apps_empty": "No Slack apps yet. Create an app in Slack, then add its credentials here to connect agents to your workspace.",
++  "com_agents_mcp_files_label": "MCP files",
++  "com_agents_mcp_files_description": "Files added once here are available to every MCP tool in the sandbox. They are not injected into the model context.",
++  "com_agents_mcp_files_disabled": "Uploads are disabled for this endpoint.",
++  "com_ui_upload_mcp_files": "Upload MCP files"
+ }
+diff --git a/client/src/locales/fr/translation.json b/client/src/locales/fr/translation.json
+index 3f1cb5b35..4ef4b76b4 100644
+--- a/client/src/locales/fr/translation.json
++++ b/client/src/locales/fr/translation.json
+@@ -1491,5 +1491,9 @@
+   "com_ui_zoom_level": "Niveau de zoom",
+   "com_ui_zoom_out": "Dézoomer",
+   "com_user_message": "Vous",
+-  "com_ui_feedback_tag_other_issue": "Autre"
++  "com_ui_feedback_tag_other_issue": "Autre",
++  "com_agents_mcp_files_label": "Fichiers MCP",
++  "com_agents_mcp_files_description": "Les fichiers ajoutés ici sont disponibles pour tous les outils MCP dans le bac à sable. Ils ne sont pas injectés dans le contexte du modèle.",
++  "com_agents_mcp_files_disabled": "Les téléversements sont désactivés pour ce point de terminaison.",
++  "com_ui_upload_mcp_files": "Téléverser des fichiers MCP"
+ }
+diff --git a/client/src/utils/forms.tsx b/client/src/utils/forms.tsx
+index 5b8e845ac..1def1e1a9 100644
+--- a/client/src/utils/forms.tsx
++++ b/client/src/utils/forms.tsx
+@@ -84,6 +84,9 @@ export const processAgentOption = ({
+     code_files: _agent?.tool_resources?.execute_code?.file_ids
+       ? ([] as Array<[string, ExtendedFile]>)
+       : undefined,
++    mcp_files: _agent?.tool_resources?.mcp?.file_ids
++      ? ([] as Array<[string, ExtendedFile]>)
++      : undefined,
+   };
+ 
+   if (!fileMap) {
+@@ -164,5 +167,11 @@ export const processAgentOption = ({
+     );
+   }
+ 
++  if (agent.mcp_files && _agent?.tool_resources?.mcp?.file_ids) {
++    _agent.tool_resources.mcp.file_ids.forEach((file_id) =>
++      handleFile({ file_id, list: agent.mcp_files, tool_resource: EToolResources.mcp }),
++    );
++  }
++
+   return agent;
+ };
+diff --git a/e2e/playwright.azci.config.ts b/e2e/playwright.azci.config.ts
+new file mode 100644
+index 000000000..4d06ddd87
+--- /dev/null
++++ b/e2e/playwright.azci.config.ts
+@@ -0,0 +1,22 @@
++import { defineConfig } from '@playwright/test';
++
++/**
++ * Standalone config for the azureci on-demand E2E. The default config's global setup
++ * registers and later deletes its own user; this suite must run against an existing
++ * test account that owns the agent, so it has no global setup/teardown.
++ */
++export default defineConfig({
++  testDir: 'specs/real',
++  testMatch: /azci-on-demand\.spec\.ts/,
++  fullyParallel: false,
++  workers: 1,
++  timeout: 300000,
++  reporter: [['line']],
++  use: {
++    baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:3080',
++    headless: true,
++    ignoreHTTPSErrors: true,
++    screenshot: 'only-on-failure',
++    trace: 'retain-on-failure',
++  },
++});
+diff --git a/e2e/specs/real/azci-on-demand.spec.ts b/e2e/specs/real/azci-on-demand.spec.ts
+new file mode 100644
+index 000000000..435986f01
+--- /dev/null
++++ b/e2e/specs/real/azci-on-demand.spec.ts
+@@ -0,0 +1,79 @@
++import { expect, test } from '@playwright/test';
++import type { Page } from '@playwright/test';
++import { openAgentBuilder } from '../mock/agents.helpers';
++import { fetchJson, getAccessToken } from '../mock/helpers';
++
++/**
++ * LOCAL-ONLY real-provider verification of the Azure code-interpreter MCP tool's
++ * on-demand files. Skipped unless AZCI_E2E=1, because it needs a running azureci
++ * MCP server, the test agent, and a file already added to its MCP files pool.
++ *
++ *   AZCI_E2E=1 AZCI_AGENT_NAME="Azure Code Interpreter" AZCI_FILE=contract.docx \
++ *   AZCI_EXPECT="Service Agreement" npx playwright test e2e/specs/real/azci-on-demand.spec.ts
++ */
++
++const AGENT_NAME = process.env.AZCI_AGENT_NAME ?? 'Azure Code Interpreter';
++const USER_EMAIL = process.env.AZCI_USER ?? 'azci-test@local.test';
++const USER_PASSWORD = process.env.AZCI_PASSWORD ?? 'AzciTest123!';
++const FILE_NAME = process.env.AZCI_FILE ?? 'contract.docx';
++const EXPECTED_TEXT = process.env.AZCI_EXPECT ?? 'Service Agreement';
++
++type AgentSummary = { id: string; name: string };
++
++async function selectAgentForChat(page: Page, agentName: string) {
++  const form = await openAgentBuilder(page);
++  await form.getByRole('combobox', { name: 'Agent', exact: true }).click();
++  await page.getByRole('option', { name: agentName }).click();
++  await expect(form.getByLabel('Agent name')).toHaveValue(agentName);
++  await form.getByRole('button', { name: 'Select Agent' }).click();
++  await expect(page.getByRole('textbox', { name: 'Message input' })).toBeVisible();
++}
++
++test.describe('azureci on-demand files (real provider)', () => {
++  test.skip(process.env.AZCI_E2E !== '1', 'set AZCI_E2E=1 to run against a live azureci server');
++
++  test('lists files without loading, then loads one on request', async ({ page }) => {
++    test.setTimeout(240000);
++    await page.context().clearCookies();
++    await page.goto('/login');
++    const loginForm = page.getByRole('form', { name: 'Login form' });
++    if (await loginForm.isVisible().catch(() => false)) {
++      await page.getByLabel('Email').fill(USER_EMAIL);
++      await page.getByLabel('Password').fill(USER_PASSWORD);
++      await page.getByTestId('login-button').click();
++      await page.waitForURL(/\/c\//, { timeout: 30000 });
++    }
++    await page.goto('/c/new');
++
++    const token = await getAccessToken(page);
++    const agentsResponse = await fetchJson<AgentSummary[] | { agents?: AgentSummary[]; data?: AgentSummary[] }>(
++      page,
++      '/api/agents',
++      token,
++    );
++    const agents = Array.isArray(agentsResponse)
++      ? agentsResponse
++      : (agentsResponse?.agents ?? agentsResponse?.data ?? []);
++    const agent = agents.find((entry) => entry.name === AGENT_NAME);
++    expect(agent, `agent "${AGENT_NAME}" should exist`).toBeTruthy();
++
++    await selectAgentForChat(page, AGENT_NAME);
++
++    const input = page.getByRole('textbox', { name: 'Message input' });
++    await input.fill(
++      'Without loading any files, use run_code to list /mnt/data and tell me which files are available.',
++    );
++    await input.press('Enter');
++    await expect(page.getByText(FILE_NAME).last()).toBeVisible({ timeout: 180000 });
++    await expect(page.getByText(/available|not loaded/i).last()).toBeVisible({ timeout: 30000 });
++
++    const conversationId = page.url().split('/c/')[1]?.split('?')[0];
++    expect(conversationId).toBeTruthy();
++
++    await input.fill(`Now load ${FILE_NAME} with attach_files and print its contents.`);
++    await input.press('Enter');
++    await expect(page.getByText(EXPECTED_TEXT).last()).toBeVisible({ timeout: 180000 });
++    // The tool ran: its result card carries the MCP server name.
++    await expect(page.getByText('Azureci').last()).toBeVisible({ timeout: 30000 });
++  });
++});
+diff --git a/packages/api/src/files/code/preflight.spec.ts b/packages/api/src/files/code/preflight.spec.ts
+index 4741627e5..7233c58ae 100644
+--- a/packages/api/src/files/code/preflight.spec.ts
++++ b/packages/api/src/files/code/preflight.spec.ts
+@@ -64,6 +64,29 @@ describe('preflightCodeOutputBatch', () => {
+     expect(result.every((entry) => entry.downloadFallback !== true)).toBe(true);
+   });
+ 
++  it('uses a caller-supplied preparedBuffer without a Code API download', async () => {
++    const prepare = jest.fn(async (input: PrepareCodeOutputInput) => prepared(input));
++    const art = artifact(1);
++    (art.files[0] as { preparedBuffer?: Buffer }).preparedBuffer = Buffer.from('preset-bytes');
++
++    const result = await preflightCodeOutputBatch({ artifact: art, limits, prepare });
++
++    expect(prepare).not.toHaveBeenCalled();
++    expect(result[0].preparedBuffer?.toString()).toBe('preset-bytes');
++    expect(result[0].downloadFallback).not.toBe(true);
++  });
++
++  it('falls back when a caller-supplied buffer exceeds the transport budget', async () => {
++    const prepare = jest.fn(async (input: PrepareCodeOutputInput) => prepared(input));
++    const art = artifact(1);
++    (art.files[0] as { preparedBuffer?: Buffer }).preparedBuffer = Buffer.alloc(64);
++
++    const result = await preflightCodeOutputBatch({ artifact: art, limits, prepare });
++
++    expect(prepare).not.toHaveBeenCalled();
++    expect(result[0].downloadFallback).toBe(true);
++  });
++
+   it('treats zero byte limits as unlimited within the hard transport ceiling', async () => {
+     const prepare = jest.fn(async (input: PrepareCodeOutputInput) =>
+       prepared(input, { buffer: Buffer.alloc(4) }),
+diff --git a/packages/api/src/files/code/preflight.ts b/packages/api/src/files/code/preflight.ts
+index 05c9caf1a..bca55f154 100644
+--- a/packages/api/src/files/code/preflight.ts
++++ b/packages/api/src/files/code/preflight.ts
+@@ -183,6 +183,21 @@ export async function preflightCodeOutputBatch(
+ 
+     let prepared: PreparedCodeOutput;
+     try {
++      // A caller (e.g. an MCP artifact bridge) may have already fetched the bytes and
++      // attached them as `preparedBuffer`; honour that instead of a Code API download.
++      const preset = (entry.file as { preparedBuffer?: Buffer }).preparedBuffer;
++      if (preset && preset.length > 0) {
++        if (preset.length > transportBytes) {
++          if (inspectionActive) {
++            throw new UninspectableFileError(resourceField);
++          }
++          entries[index] = { ...entry, downloadFallback: true };
++          continue;
++        }
++        inspectedBytes += preset.length;
++        entries[index] = { ...entry, preparedBuffer: preset };
++        continue;
++      }
+       prepared = await input.prepare({
+         file: entry.file,
+         sessionId: entry.sessionId,
+diff --git a/packages/api/src/mcp/__tests__/parsers.test.ts b/packages/api/src/mcp/__tests__/parsers.test.ts
+index a2955ef7c..e73dae68c 100644
+--- a/packages/api/src/mcp/__tests__/parsers.test.ts
++++ b/packages/api/src/mcp/__tests__/parsers.test.ts
+@@ -2112,4 +2112,39 @@ describe('isRenderableUiResource media types', () => {
+       text: '<p>read document</p>',
+     });
+   });
++
++  describe('generic MCP file artifacts (structuredContent.artifacts)', () => {
++    it('forwards base64 bytes as code-artifact files with the authoring opt-in', () => {
++      const csv = Buffer.from('a,b\n1,2\n').toString('base64');
++      const result: t.MCPToolCallResponse = {
++        content: [{ type: 'text', text: 'generated out.csv' }],
++        structuredContent: {
++          artifacts: [{ name: 'out.csv', bytes: csv, mimeType: 'text/csv' }],
++        },
++      };
++
++      const [, artifacts] = formatToolContent(result, 'openai');
++
++      expect(artifacts?.__librechat_file_authoring).toBe(true);
++      expect(artifacts?.files).toHaveLength(1);
++      expect(artifacts?.files?.[0]).toMatchObject({ id: 'out.csv', name: 'out.csv' });
++      expect(artifacts?.files?.[0]?.preparedBuffer?.toString()).toBe('a,b\n1,2\n');
++    });
++
++    it('returns no authoring opt-in for an empty or malformed list', () => {
++      const empty: t.MCPToolCallResponse = {
++        content: [{ type: 'text', text: 'nothing' }],
++        structuredContent: { artifacts: [] },
++      };
++      const [, a1] = formatToolContent(empty, 'openai');
++      expect(a1?.__librechat_file_authoring).toBeUndefined();
++
++      const bad: t.MCPToolCallResponse = {
++        content: [{ type: 'text', text: 'nothing' }],
++        structuredContent: { artifacts: [{ name: 42, bytes: 'abcd' }] },
++      };
++      const [, a2] = formatToolContent(bad, 'openai');
++      expect(a2?.__librechat_file_authoring).toBeUndefined();
++    });
++  });
+ });
+diff --git a/packages/api/src/mcp/parsers.ts b/packages/api/src/mcp/parsers.ts
+index 5ed8cd9e1..393e9af4a 100644
+--- a/packages/api/src/mcp/parsers.ts
++++ b/packages/api/src/mcp/parsers.ts
+@@ -316,6 +316,34 @@ export function isRenderableUiResource(item: t.ToolContentPart): boolean {
+   return isHtmlMediaType(resolveMCPUIResourceMimeType(item.resource.mimeType));
+ }
+ 
++/**
++ * Generic MCP artifact contract: any MCP tool may return `structuredContent.artifacts[]`
++ * (`{ name, bytes(base64) }`), which becomes a native LibreChat attachment through the
++ * code-output pipeline. The `__librechat_file_authoring` opt-in routes the result through
++ * `isCodeArtifactToolOutput` in `packages/api/src/agents/tools.ts`.
++ */
++function extractMCPFileArtifacts(result: t.MCPToolCallResponse):
++  | Array<{ id: string; name: string; preparedBuffer: Buffer }>
++  | undefined {
++  const list = (result?.structuredContent as { artifacts?: unknown } | undefined)?.artifacts;
++  if (!Array.isArray(list) || list.length === 0) {
++    return undefined;
++  }
++  const files: Array<{ id: string; name: string; preparedBuffer: Buffer }> = [];
++  for (const item of list) {
++    const entry = item as { name?: unknown; bytes?: unknown };
++    if (typeof entry.name !== 'string' || !entry.name || typeof entry.bytes !== 'string') {
++      continue;
++    }
++    const buffer = Buffer.from(entry.bytes, 'base64');
++    if (buffer.length === 0) {
++      continue;
++    }
++    files.push({ id: entry.name, name: entry.name, preparedBuffer: buffer });
++  }
++  return files.length ? files : undefined;
++}
++
+ /**
+  * Converts MCPToolCallResponse content into a plain-text string plus optional artifacts
+  * (images, UI resources). All providers receive string content; images are separated into
+@@ -594,5 +622,14 @@ UI Resource Markers Available:
+     };
+   }
+ 
++  const mcpFiles = extractMCPFileArtifacts(result);
++  if (mcpFiles) {
++    artifacts = {
++      ...artifacts,
++      __librechat_file_authoring: true,
++      files: mcpFiles,
++    };
++  }
++
+   return [currentTextBlock || (artifacts !== undefined ? '' : '(No response)'), artifacts];
+ }
+diff --git a/packages/api/src/mcp/types/index.ts b/packages/api/src/mcp/types/index.ts
+index 649ee8430..c030e0e15 100644
+--- a/packages/api/src/mcp/types/index.ts
++++ b/packages/api/src/mcp/types/index.ts
+@@ -159,9 +159,10 @@ export type Artifacts =
+         fileCitations?: boolean;
+       };
+       [Tools.web_search]?: SearchResultData;
+-      files?: Array<{ id: string; name: string }>;
++      files?: Array<{ id: string; name: string; preparedBuffer?: Buffer }>;
+       session_id?: string;
+       file_ids?: string[];
++      __librechat_file_authoring?: boolean;
+     }
+   | undefined;
+ 
+diff --git a/packages/data-provider/src/types/agents.ts b/packages/data-provider/src/types/agents.ts
+index 8f2767139..f2b854b77 100644
+--- a/packages/data-provider/src/types/agents.ts
++++ b/packages/data-provider/src/types/agents.ts
+@@ -972,6 +972,8 @@ export interface AgentToolResources {
+   [EToolResources.execute_code]?: ExecuteCodeResource;
+   [EToolResources.file_search]?: AgentFileResource;
+   [EToolResources.context]?: AgentBaseResource;
++  /** Files added once for MCP tools; never injected into the prompt. */
++  [EToolResources.mcp]?: AgentBaseResource;
+   /** @deprecated Use context instead */
+   [EToolResources.ocr]?: AgentBaseResource;
+ }
+diff --git a/packages/data-provider/src/types/tools.ts b/packages/data-provider/src/types/tools.ts
+index ecd865026..deb9e325d 100644
+--- a/packages/data-provider/src/types/tools.ts
++++ b/packages/data-provider/src/types/tools.ts
+@@ -24,6 +24,8 @@ export enum EToolResources {
+   image_edit = 'image_edit',
+   context = 'context',
+   ocr = 'ocr',
++  /** Shared file pool for MCP tools; not injected into model context. */
++  mcp = 'mcp',
+ }
+ 
+ export type Tool = {

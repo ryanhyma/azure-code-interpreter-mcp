@@ -1,0 +1,18 @@
+[Unit]
+Description=Azure Code Interpreter MCP server (streamable-http on the docker0 bridge)
+Documentation=file:///home/hyma/dev/azure-ci-mcp/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hyma/dev/azure-ci-mcp
+Environment=AZCI_ENV_FILE=%h/.config/azure-ci-mcp/env
+ExecStart=/home/hyma/dev/azure-ci-mcp/.venv/bin/azure-ci-mcp serve
+Restart=on-failure
+RestartSec=5
+Nice=5
+# MCP binds to 172.17.0.1 (docker0 gateway) and downloads to 127.0.0.1 only;
+# see tests/boundary.sh.
+
+[Install]
+WantedBy=default.target

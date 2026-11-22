@@ -1,0 +1,7 @@
+# Derived from the clean v0.8.9 + MCP artifact-bridge build.
+# Dockerfile.multi copies /app/api as root; the runtime user (1000) needs a writable log dir.
+ARG BASE_IMAGE=librechat-azci:v0.8.9-r12
+FROM ${BASE_IMAGE}
+USER root
+RUN mkdir -p /app/api/logs && chown -R 1000:1000 /app/api/logs
+USER node
