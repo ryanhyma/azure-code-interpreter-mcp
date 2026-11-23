@@ -300,6 +300,43 @@ async def test_agent_id_header_reaches_the_file_bridge(tmp_path):
     assert urls and "agentId=agent-1" in urls[0]
 
 
+async def test_new_chat_attachment_is_imported_on_the_next_run(tmp_path):
+    """A file added after the first run is sent; the already-imported one is not."""
+    state = {"files": [{"file_id": "f1", "filename": "a.csv", "type": "text/csv", "bytes": 1}]}
+    posts = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/azci/files":
+            return httpx.Response(200, json={"files": state["files"]})
+        if request.url.path.startswith("/api/azci/files/"):
+            return httpx.Response(200, content=b"x")
+        if request.method == "POST":
+            body = json.loads(request.content)
+            posts.append(body)
+            cid = body["tools"][0]["container"]
+            return ok_response(cid if isinstance(cid, str) else "cntr_fresh_1", with_citation=False)
+        if request.method == "GET":
+            if request.url.path.endswith("/files"):
+                return httpx.Response(200, json={"object": "list", "data": []})
+            return httpx.Response(200, content=b"")
+        return httpx.Response(200, json={"deleted": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = make_runtime(client, tmp_path)
+    headers = {"x-azci-token": "tok", "x-librechat-user-id": "u1", "x-librechat-conversation-id": "c1"}
+
+    def input_files(body):
+        return [p for p in body["input"][0]["content"] if p["type"] == "input_file"]
+
+    await handle_run(rt, headers, code="print(1)", attach_files="all")
+    assert [f["filename"] for f in input_files(posts[0])] == ["a.csv"]
+
+    # The user attaches a second file; the next "all" run sends only the new one.
+    state["files"].append({"file_id": "f2", "filename": "b.csv", "type": "text/csv", "bytes": 1})
+    await handle_run(rt, headers, code="print(2)", attach_files="all")
+    assert [f["filename"] for f in input_files(posts[1])] == ["b.csv"]
+
+
 async def test_only_files_created_by_this_run_are_returned(tmp_path):
     """A reused container's older assistant files must not be re-attached."""
     lists = {"n": 0}
