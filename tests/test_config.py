@@ -45,6 +45,15 @@ def test_process_env_wins_over_env_file(tmp_path, monkeypatch):
     assert config.azure_api_key == "env-key"
 
 
+def test_store_artifacts_flag(monkeypatch):
+    monkeypatch.setenv("AZURE_AI_KEY", "k")
+    monkeypatch.setenv("AZCI_MCP_TOKEN", "t")
+    monkeypatch.delenv("AZCI_STORE_ARTIFACTS", raising=False)
+    assert load(None).store_artifacts is True
+    monkeypatch.setenv("AZCI_STORE_ARTIFACTS", "false")
+    assert load(None).store_artifacts is False
+
+
 def test_defaults_when_unset(monkeypatch):
     monkeypatch.setenv("AZURE_AI_KEY", "k")
     monkeypatch.setenv("AZCI_MCP_TOKEN", "t")

@@ -45,6 +45,9 @@ class Config:
     download_port: int = 8936
     artifact_dir: Path = field(default_factory=_default_artifact_dir)
     retention_days: int = 7
+    # Keep a local copy of sandbox outputs (durable fallback + signed links).
+    # Disable for a pure pass-through: outputs only travel inline to LibreChat.
+    store_artifacts: bool = True
     default_timeout_s: int = 180
     max_timeout_s: int = 600
     max_concurrency: int = 4
@@ -127,6 +130,7 @@ def load(env_file: Path | None = None) -> Config:
         download_port=pick_int("AZCI_DOWNLOAD_PORT", 8936),
         artifact_dir=Path(pick("AZCI_ARTIFACT_DIR", str(_default_artifact_dir()))),
         retention_days=pick_int("AZCI_RETENTION_DAYS", 7),
+        store_artifacts=pick("AZCI_STORE_ARTIFACTS", "true").lower() != "false",
         default_timeout_s=pick_int("AZCI_DEFAULT_TIMEOUT_S", 180),
         max_timeout_s=pick_int("AZCI_MAX_TIMEOUT_S", 600),
         max_concurrency=pick_int("AZCI_MAX_CONCURRENCY", 4),

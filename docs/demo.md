@@ -144,6 +144,12 @@ then turn 2 loads it with `attach_files` and prints its contents. Skipped unless
 override with `AZCI_AGENT_NAME`, `AZCI_FILE`, `AZCI_EXPECT`, `AZCI_USER`, `AZCI_PASSWORD`.
 The config deliberately omits the default global setup because that setup deletes its user.
 
+## Artifact storage toggle
+
+`AZCI_STORE_ARTIFACTS` (default `true`) controls the local 7-day copy and signed links. With `false`
+the server is pass-through: outputs go inline to LibreChat, the download listener on `127.0.0.1:8936`
+is not started, and no fallback link exists.
+
 ## Known limitations
 
 - Input `files` are inert in v1 (chat attachments are not auto-forwarded).

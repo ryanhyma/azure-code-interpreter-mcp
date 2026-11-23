@@ -9,6 +9,7 @@ from azci_mcp.artifacts import ArtifactStore
 from azci_mcp.config import Config
 from azci_mcp.sessions import SessionRegistry
 from azci_mcp.server import (
+    OutputFile,
     Runtime,
     authenticate,
     build_result,
@@ -159,7 +160,13 @@ def test_build_result_includes_inline_image_and_artifact_entries(tmp_path):
     csv = b"a,b\n1,2\n"
     art_png = store.save(user_hash="u", conversation="c", run_id="r", name="plot.png", data=png, mime_type="image/png")
     art_csv = store.save(user_hash="u", conversation="c", run_id="r", name="out.csv", data=csv, mime_type="text/csv")
-    result = build_result(cfg, store, run_id="resp", code="x", stdout="42\n", answer="42", artifacts=[art_png, art_csv])
+    files = [
+        OutputFile(name=art_png.name, mime_type=art_png.mime_type, size=art_png.size,
+                   data=store._data_path(art_png).read_bytes(), artifact=art_png),
+        OutputFile(name=art_csv.name, mime_type=art_csv.mime_type, size=art_csv.size,
+                   data=store._data_path(art_csv).read_bytes(), artifact=art_csv),
+    ]
+    result = build_result(cfg, store, run_id="resp", code="x", stdout="42\n", answer="42", files=files)
     content_types = [c.type for c in result.content]
     assert "image" in content_types
     assert result.structured_content is not None
@@ -214,6 +221,20 @@ async def test_handle_run_invalid_input_makes_no_azure_call(tmp_path):
     result = await handle_run(rt, {"x-azci-token": "tok"}, code="")
     assert result.is_error is True
     assert state["responses"] == []
+
+
+def test_build_result_pass_through_has_bytes_but_no_links(tmp_path):
+    cfg = config(artifact_dir=tmp_path, store_artifacts=False)
+    store = ArtifactStore(cfg)
+    data = b"a,b\n1,2\n"
+    files = [OutputFile(name="out.csv", mime_type="text/csv", size=len(data), data=data)]
+    result = build_result(cfg, store, run_id="resp", code="x", stdout="", answer="", files=files)
+    entry = result.structured_content["artifacts"][0]
+    assert entry["name"] == "out.csv"
+    assert "bytes" in entry
+    assert "downloadUrl" not in entry and "browserUrl" not in entry
+    text = next(c.text for c in result.content if hasattr(c, "text"))
+    assert "http://" not in text
 
 
 async def test_handle_run_attaches_chat_files_as_input(tmp_path):

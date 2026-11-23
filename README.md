@@ -46,7 +46,9 @@ Write a `0600` env file (`deploy/env.example` is a template) and point the servi
 Optional: `AZCI_AZURE_BASE_URL`, `AZCI_MODEL`, `AZCI_MCP_HOST`, `AZCI_MCP_PORT`,
 `AZCI_DOWNLOAD_HOST`, `AZCI_DOWNLOAD_PORT`, `AZCI_ARTIFACT_DIR`, `AZCI_RETENTION_DAYS`,
 `AZCI_DEFAULT_TIMEOUT_S`, `AZCI_MAX_TIMEOUT_S`, `AZCI_MAX_CONCURRENCY`,
-`AZCI_CONTAINER_IDLE_TTL_S`, `AZCI_LIBRECHAT_URL`, `AZCI_ATTACH_CHAT_FILES`.
+`AZCI_CONTAINER_IDLE_TTL_S`, `AZCI_LIBRECHAT_URL`, `AZCI_ATTACH_CHAT_FILES`,
+`AZCI_STORE_ARTIFACTS` (default `true`; `false` = pass-through: inline bytes only, no local copy,
+signed link or download listener).
 
 ## Run
 
@@ -67,6 +69,7 @@ Optional: `AZCI_AZURE_BASE_URL`, `AZCI_MODEL`, `AZCI_MCP_HOST`, `AZCI_MCP_PORT`,
 - `attach_files` — names to copy into `/mnt/data`, or `"all"`; default `"none"` so the result shows a
   manifest only. Loaded files are normalized to `/mnt/data/<name>`.
 - Returns stdout, the answer, inline images, generated files, the remaining manifest, and usage.
+- With `AZCI_STORE_ARTIFACTS=false`, outputs are only inlined (no `downloadUrl`, no `/f/` listener).
 
 ## LibreChat integration
 

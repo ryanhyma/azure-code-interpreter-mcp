@@ -58,6 +58,17 @@ class Identity:
 
 
 @dataclass
+class OutputFile:
+    """A sandbox output ready to render, stored or pass-through."""
+
+    name: str
+    mime_type: str
+    size: int
+    data: bytes
+    artifact: Artifact | None = None
+
+
+@dataclass
 class Runtime:
     config: Config
     client: httpx.AsyncClient
@@ -168,10 +179,14 @@ def build_result(
     code: str,
     stdout: str,
     answer: str,
-    artifacts: list[Artifact],
+    files: list[OutputFile],
     available: list[dict] | None = None,
 ) -> CallToolResult:
-    """Text + inline images + the generic structuredContent.artifacts contract."""
+    """Text + inline images + the generic structuredContent.artifacts contract.
+
+    With `store_artifacts` off the bytes still travel inline, but no local copy or
+    signed link is produced and the download listener is not started.
+    """
     content: list = []
     lines = [f"run {run_id}"]
     if stdout:
@@ -181,30 +196,36 @@ def build_result(
 
     artifact_entries: list[dict] = []
     file_lines: list[str] = []
-    for art in artifacts:
-        token = store.token(art.id)
-        browser = f"{config.download_origin}/f/{art.id}?t={token}"
-        bridge = f"{config.bridge_origin}/f/{art.id}?t={token}"
-        data = store._data_path(art).read_bytes()
-        inlined = art.mime_type in IMAGE_MIME and art.size <= MAX_INLINE_IMAGE_BYTES
+    for item in files:
+        if item.artifact is not None:
+            token = store.token(item.artifact.id)
+            browser = f"{config.download_origin}/f/{item.artifact.id}?t={token}"
+            bridge = f"{config.bridge_origin}/f/{item.artifact.id}?t={token}"
+        else:
+            browser = bridge = None
+        inlined = item.mime_type in IMAGE_MIME and item.size <= MAX_INLINE_IMAGE_BYTES
         if inlined:
             # Delivered as an image block; LibreChat's image path already stores a
             # downloadable file record, so listing it here too would duplicate it.
             content.append(
-                ImageContent(type="image", data=base64.b64encode(data).decode(), mime_type=art.mime_type)
+                ImageContent(
+                    type="image",
+                    data=base64.b64encode(item.data).decode(),
+                    mime_type=item.mime_type,
+                )
             )
-        file_lines.append(f"- {art.name} → {browser}")
+        file_lines.append(f"- {item.name} → {browser}" if browser else f"- {item.name}")
         if not inlined:
-            artifact_entries.append(
-                {
-                    "name": art.name,
-                    "mimeType": art.mime_type,
-                    "bytes": base64.b64encode(data).decode(),
-                    "size": art.size,
-                    "downloadUrl": bridge,
-                    "browserUrl": browser,
-                }
-            )
+            entry = {
+                "name": item.name,
+                "mimeType": item.mime_type,
+                "bytes": base64.b64encode(item.data).decode(),
+                "size": item.size,
+            }
+            if bridge:
+                entry["downloadUrl"] = bridge
+                entry["browserUrl"] = browser
+            artifact_entries.append(entry)
     if file_lines:
         lines.append("files:\n" + "\n".join(file_lines))
     if available:
@@ -366,7 +387,7 @@ async def handle_run(
             if not generated:
                 generated = [(c.container_id, c.file_id, c.filename) for c in result.citations]
 
-            artifacts: list[Artifact] = []
+            outputs: list[OutputFile] = []
             seen: set[str] = set()
             for container_id, file_id, name in generated:
                 if file_id in seen:
@@ -375,14 +396,24 @@ async def handle_run(
                 data = await runtime.store.download_container_file(
                     runtime.client, config, container_id, file_id
                 )
-                artifacts.append(
-                    runtime.store.save(
+                mime_type = _image_extension(name)
+                artifact = None
+                if config.store_artifacts:
+                    artifact = runtime.store.save(
                         user_hash=user_hash,
                         conversation=conversation,
                         run_id=result.run_id or "run",
                         name=name,
                         data=data,
-                        mime_type=_image_extension(name),
+                        mime_type=mime_type,
+                    )
+                outputs.append(
+                    OutputFile(
+                        name=name,
+                        mime_type=artifact.mime_type if artifact else (mime_type or "application/octet-stream"),
+                        size=artifact.size if artifact else len(data),
+                        data=data,
+                        artifact=artifact,
                     )
                 )
 
@@ -396,11 +427,11 @@ async def handle_run(
                 code=code,
                 stdout=result.stdout,
                 answer=result.answer,
-                artifacts=artifacts,
+                files=outputs,
                 available=[
                     entry
                     for entry in catalog
-                    if entry["name"] not in {a.name for a in artifacts}
+                    if entry["name"] not in {o.name for o in outputs}
                     and entry["name"] not in known_names
                 ],
             )
@@ -499,25 +530,34 @@ async def _run_servers(config: Config) -> None:
             sessions=sessions,
             semaphore=asyncio.Semaphore(config.max_concurrency),
         )
-        sweep = asyncio.create_task(_sweep_loop(_runtime))
+        sweep = asyncio.create_task(_sweep_loop(_runtime)) if config.store_artifacts else None
         try:
             mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp", host=config.mcp_host)
-            download_app = build_download_app(store, config)
             import uvicorn
 
             mcp_srv = uvicorn.Server(
                 uvicorn.Config(mcp_app, host=config.mcp_host, port=config.mcp_port, log_level="info")
             )
-            dl_srv = uvicorn.Server(
-                uvicorn.Config(download_app, host=config.download_host, port=config.download_port, log_level="info")
-            )
-            await asyncio.gather(mcp_srv.serve(), dl_srv.serve())
+            servers = [mcp_srv.serve()]
+            if config.store_artifacts:
+                download_app = build_download_app(store, config)
+                dl_srv = uvicorn.Server(
+                    uvicorn.Config(
+                        download_app,
+                        host=config.download_host,
+                        port=config.download_port,
+                        log_level="info",
+                    )
+                )
+                servers.append(dl_srv.serve())
+            await asyncio.gather(*servers)
         finally:
-            sweep.cancel()
-            try:
-                await sweep
-            except asyncio.CancelledError:
-                pass
+            if sweep is not None:
+                sweep.cancel()
+                try:
+                    await sweep
+                except asyncio.CancelledError:
+                    pass
 
 
 def serve() -> int:
