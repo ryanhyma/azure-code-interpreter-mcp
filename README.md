@@ -19,6 +19,7 @@ LibreChat agent ──HTTP + X-Azci-Token──► MCP server ──HTTPS──�
 
 - **One container per `(user, conversation)`**, deleted after the 20-minute idle TTL. The model never
   sees a container id; Azure's own expiry is the backstop.
+- **Only new outputs** from the current run are returned, so a later turn never re-attaches older files.
 - **Files are on demand.** `run_code` lists what is available; nothing is copied until the model asks
   with `attach_files=[...]` (or `"all"`). Each file is imported once per container.
 - **Executor mode.** The model supplies the code, and Azure runs it verbatim. Charts come back as MCP

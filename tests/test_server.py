@@ -300,6 +300,39 @@ async def test_agent_id_header_reaches_the_file_bridge(tmp_path):
     assert urls and "agentId=agent-1" in urls[0]
 
 
+async def test_only_files_created_by_this_run_are_returned(tmp_path):
+    """A reused container's older assistant files must not be re-attached."""
+    lists = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            body = json.loads(request.content)
+            cid = body["tools"][0]["container"]
+            return ok_response(cid if isinstance(cid, str) else "cntr_fresh_1", with_citation=False)
+        if request.method == "GET" and request.url.path == "/api/azci/files":
+            return httpx.Response(200, json={"files": []})
+        if request.method == "GET" and "/containers/" in request.url.path and request.url.path.endswith("/files"):
+            lists["n"] += 1
+            data = [
+                {"id": "cfile_old", "path": "/mnt/data/old.csv", "source": "assistant"},
+            ]
+            if lists["n"] >= 3:
+                data.append({"id": "cfile_new", "path": "/mnt/data/new.csv", "source": "assistant"})
+            return httpx.Response(200, json={"object": "list", "data": data})
+        if request.method == "GET":
+            return httpx.Response(200, content=b"x")
+        return httpx.Response(200, json={"deleted": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = make_runtime(client, tmp_path)
+    headers = {"x-azci-token": "tok", "x-librechat-user-id": "u1", "x-librechat-conversation-id": "c1"}
+    await handle_run(rt, headers, code="print(1)", attach_files="all")
+    result = await handle_run(rt, headers, code="print(2)", attach_files="all")
+
+    names = [a["name"] for a in (result.structured_content or {}).get("artifacts", [])]
+    assert names == ["new.csv"]
+
+
 async def test_chat_files_are_not_reimported_into_a_live_container(tmp_path):
     """The same chat file is sent once per container, not on every call."""
     posts = []

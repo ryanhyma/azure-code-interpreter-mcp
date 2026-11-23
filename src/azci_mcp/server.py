@@ -316,6 +316,17 @@ async def handle_run(
                 container_id or "fresh",
             )
             timeout = _clamp_timeout(config, timeout_s)
+            # Snapshot what the reused container already holds so only files created by THIS
+            # run are returned; otherwise every turn re-attaches the conversation's old outputs.
+            before_ids: set[str] = set()
+            if container_id:
+                try:
+                    before_ids = {
+                        f.file_id
+                        for f in await list_container_files(runtime.client, config, container_id)
+                    }
+                except AzureError:
+                    before_ids = set()
             exec_code = hydrate_loaded_names(code, [f.name for f in chat_files])
             try:
                 result = await run(
@@ -373,6 +384,9 @@ async def handle_run(
 
             # Retrieve every code-generated file, not just the ones the model cited:
             # the model sometimes writes a file and prints its path without annotating it.
+            if result.container_id and container_id and result.container_id != container_id:
+                # The requested container expired; its replacement started empty.
+                before_ids = set()
             generated: list[tuple[str, str, str]] = []  # (container_id, file_id, name)
             if result.container_id:
                 try:
@@ -380,7 +394,7 @@ async def handle_run(
                     generated = [
                         (result.container_id, f.file_id, Path(f.path).name or f.file_id)
                         for f in listed
-                        if f.source == "assistant"
+                        if f.source == "assistant" and f.file_id not in before_ids
                     ]
                 except AzureError:
                     generated = []
